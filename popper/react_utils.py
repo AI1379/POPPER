@@ -11,6 +11,12 @@ import contextlib
 import io
 import logging
 import re
+import ast
+from pathlib import Path
+import traceback
+import warnings
+
+from popper.tool_output import ToolOutputStore, WarningSpan, bound_observation
 
 logging.basicConfig(level=logging.INFO)
 
@@ -158,28 +164,69 @@ class CustomPromptTemplate(StringPromptTemplate):
     template: str
     # The list of tools available
     tools: List[BaseTool]
+    compact_context: bool = False
+    history_output_max_chars: int = 6000
+    context_audit: list[dict] = Field(default_factory=list, exclude=True)
 
     def format(self, **kwargs) -> str:
         # Get the intermediate steps (AgentAction, Observation tuples)
         # Format them in a particular way
         intermediate_steps = kwargs.pop("intermediate_steps")
         thoughts = ""
-        for action, observation in intermediate_steps:
+        original_chars = delivered_chars = 0
+        for index, (action, observation) in enumerate(intermediate_steps):
             thoughts += action.log
-            thoughts += f"\nObservation: {observation}\nThought: "
+            view = str(observation)
+            original_chars += len(view)
+            # Keep all code/action history and the two most recent observations.
+            # Older bulky observations retain diagnostics/results and an archive handle.
+            if self.compact_context and index < len(intermediate_steps) - 2:
+                view, _ = bound_observation(view, self.history_output_max_chars)
+            delivered_chars += len(view)
+            thoughts += f"\nObservation: {view}\nThought: "
         # Set the agent_scratchpad variable to that value
         kwargs["agent_scratchpad"] = thoughts
         # Create a tools variable from the list of tools provided
         kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
         # Create a list of tool names for the tools provided
         kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
-        prompt = self.template.format(**kwargs)
+        active_template = self.template
+        if self.compact_context:
+            # Drop the unrelated, long biology example, retaining every protocol
+            # and statistical-integrity instruction surrounding it.
+            marker = "--------------------------------------------"
+            before, separator, rest = active_template.partition(marker)
+            if separator:
+                _, end, after = rest.partition(marker)
+                if end:
+                    active_template = before + after
+            kwargs["system_prompt"] += (
+                "\nKeep tool output focused: print shapes/missingness, relevant summaries, "
+                "test statistics, p-values and numerical diagnostics. Avoid dumping full "
+                "datasets or every bootstrap fit. Repeated warnings are shown once with "
+                "their counts; numerical/convergence warnings still require review. "
+                "Full tool output is archived locally. For omitted details use "
+                "print(read_tool_output(handle, start=0, length=4000, raw=False)); "
+                "raw=True retrieves the original output. Data and computed variables "
+                "remain available in the persistent Python namespace."
+            )
+        prompt = active_template.format(**kwargs)
+        self.context_audit.append({"steps": len(intermediate_steps), "prompt_chars": len(prompt),
+                                   "observation_chars": original_chars,
+                                   "delivered_observation_chars": delivered_chars,
+                                   "compact_context": self.compact_context})
         # print([prompt])
         return prompt
 
 # CustomOutputParser to parse the output of the LLM and execute actions
 class CustomOutputParser(AgentOutputParser):
-    def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
+    reply_audit: list[dict] = Field(default_factory=list, exclude=True)
+
+    def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
+        llm_output = text
+        self.reply_audit.append({"content": text,
+                                 "observation_markers": text.count("Observation:"),
+                                 "finished": "Final Answer:" in text})
         # Check if agent should finish
         if "Final Answer:" in llm_output:
             return AgentFinish(
@@ -204,11 +251,43 @@ class CustomOutputParser(AgentOutputParser):
 
 class CustomPythonAstREPLTool(PythonAstREPLTool):
     _exec_globals:Dict = PrivateAttr()
+    _output_store: ToolOutputStore | None = PrivateAttr(default=None)
+    _context_prompt: CustomPromptTemplate | None = PrivateAttr(default=None)
+    _executions: list[dict] = PrivateAttr(default_factory=list)
+    _protocol_audit: list[dict] = PrivateAttr(default_factory=list)
+
+    @property
+    def executions(self) -> list[dict]:
+        return self._executions
+
+    @property
+    def protocol_audit(self) -> list[dict]:
+        return self._protocol_audit
+
+    def set_result_recorder(self, recorder):
+        self._exec_globals["record_test_result"] = recorder
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Initialize a persistent global namespace for code execution
         self._exec_globals = {}
         self._exec_globals.update(__builtins__)
+
+    def configure_output(self, root: Path, max_chars: int = 12000,
+                         compact_context: bool = True, history_max_chars: int = 6000,
+                         compact_output: bool = True):
+        self._output_store = ToolOutputStore(root, max_chars, compact_output)
+        self._exec_globals["read_tool_output"] = self._output_store.read
+        if self._context_prompt is not None:
+            self._context_prompt.compact_context = compact_context
+            self._context_prompt.history_output_max_chars = history_max_chars
+
+    @property
+    def output_audit(self) -> list[dict]:
+        return self._output_store.audit if self._output_store is not None else []
+
+    @property
+    def context_audit(self) -> list[dict]:
+        return self._context_prompt.context_audit if self._context_prompt is not None else []
     
     def _set_globals(self, table_dict=None):
         self._exec_globals = {}
@@ -216,6 +295,8 @@ class CustomPythonAstREPLTool(PythonAstREPLTool):
         
         if table_dict:
             self._exec_globals.update(table_dict)
+        if self._output_store is not None:
+            self._exec_globals["read_tool_output"] = self._output_store.read
         
     def _run(self, query: str, run_manager=None):
         code_match = re.search(r"```(.*?)```", query, re.DOTALL)
@@ -231,27 +312,49 @@ class CustomPythonAstREPLTool(PythonAstREPLTool):
         if code.endswith("Observation"):
             code = code[:-len("Observation")].rstrip()
         
-        code_lines = code.strip().split('\n')
-        code = '\n'.join(code_lines[:-1])   # avoid printing the last line twice
-        last_line = code_lines[-1]
-        
         output_capture = io.StringIO()
-        with contextlib.redirect_stdout(output_capture), contextlib.redirect_stderr(output_capture):
-            logging.getLogger().handlers[0].stream = output_capture
-            try:
-                exec(code, self._exec_globals)
+        captured_warnings: list[WarningSpan] = []
+        succeeded = False
+
+        def capture_warning(message, category, filename, lineno, file=None, line=None):
+            start = output_capture.tell()
+            output_capture.write(warnings.formatwarning(message, category, filename, lineno, line))
+            captured_warnings.append(WarningSpan(start, output_capture.tell(), category.__name__,
+                                                  str(message), f"{filename}:{lineno}"))
+
+        streams = [(handler, handler.stream) for handler in logging.getLogger().handlers
+                   if isinstance(handler, logging.StreamHandler)]
+        try:
+            with contextlib.redirect_stdout(output_capture), contextlib.redirect_stderr(output_capture), warnings.catch_warnings():
+                if self._output_store is not None:
+                    warnings.showwarning = capture_warning
+                for handler, _ in streams:
+                    handler.stream = output_capture
                 try:
-                    result = eval(last_line, self._exec_globals)
-                    if result is not None:
-                        print(result, file=output_capture)
-                except:
-                    pass
-            except Exception as e:
-                return str(e)
+                    tree = ast.parse(code)
+                    last_statement = tree.body[-1] if tree.body else None
+                    if isinstance(last_statement, ast.Expr):
+                        tree.body.pop()
+                        exec(compile(tree, "<python_repl_ast>", "exec"), self._exec_globals)
+                        result = eval(compile(ast.Expression(last_statement.value), "<python_repl_ast>", "eval"), self._exec_globals)
+                        if result is not None:
+                            print(result, file=output_capture)
+                    else:
+                        exec(compile(tree, "<python_repl_ast>", "exec"), self._exec_globals)
+                    succeeded = True
+                except Exception:
+                    traceback.print_exc(file=output_capture)
+        finally:
+            for handler, previous_stream in streams:
+                handler.stream = previous_stream
         
         # Retrieve the output and return it
         output = output_capture.getvalue()
-        return output if output else "Execution completed without output."
+        output = output if output else "Execution completed without output."
+        self._executions.append({"code": code, "output": output, "succeeded": succeeded})
+        if self._output_store is not None:
+            return self._output_store.publish(output, code=code, spans=captured_warnings)
+        return output
 
 
 def create_agent(
@@ -262,7 +365,8 @@ def create_agent(
 ):
     output_parser = CustomOutputParser()
     python_tool = CustomPythonAstREPLTool(callbacks=handlers)
-    tools = [python_tool]
+    python_tool._protocol_audit = output_parser.reply_audit
+    tools: List[BaseTool] = [python_tool]
     tool_names = [tool.name for tool in tools]
 
     prompt = CustomPromptTemplate(
@@ -270,6 +374,8 @@ def create_agent(
         tools=tools,
         input_variables=["system_prompt", "input", "intermediate_steps", "tool_names", "tools", "agent_scratchpad"]
     )
+    # Retain the prompt object for opt-in configuration/auditing after creation.
+    python_tool._context_prompt = prompt
     # llm_chain = LLMChain(llm=llm, prompt=prompt, callbacks=handlers)
 
     # agent = LLMSingleActionAgent(

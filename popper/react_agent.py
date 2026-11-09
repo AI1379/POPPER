@@ -1,5 +1,6 @@
 from popper.react_utils import create_agent
 from popper.prompt_utils import get_react_coding_agent_system_prompt
+from popper.utils import get_llm
 from popper.llm.custom_model import CustomChatModel
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
@@ -77,10 +78,13 @@ class ReactAgent():
         prompt_revision: bool = False,
         port=None,
         api_key="EMPTY",
+        base_url=None,
     ):
         self.prompt_revision = prompt_revision
         self.api = "custom"
-        if model_name[:7] == 'claude-':
+        if base_url is not None:
+            self.api = 'openai'
+        elif model_name[:7] == 'claude-':
             self.api = 'anthropic'
         elif model_name[:4] == 'gpt-':
             self.api = 'openai'
@@ -101,7 +105,8 @@ class ReactAgent():
             api=self.api,
             model=self.model_name,
             port=port,
-            api_key=api_key
+            api_key=api_key,
+            base_url=base_url,
         )
 
         # create agent
@@ -110,6 +115,27 @@ class ReactAgent():
             handlers=[self.stdout_handler],
             max_iterations=self.max_iterations
         )
+        self.execution_mode = "legacy"
+        self.last_result = None
+
+    def configure_execution(self, mode="legacy", max_protocol_retries=2):
+        from popper.execution import GuardedExecutor
+        if mode not in ("legacy", "guarded_text", "native_tools"):
+            raise ValueError("Unknown execution mode")
+        if mode == "legacy":
+            self.agent = create_agent(self.llm, [self.stdout_handler], self.max_iterations)
+        else:
+            self.agent = GuardedExecutor(self.llm, mode, self.max_iterations, max_protocol_retries)
+        self.execution_mode = mode
+        self.last_result = None
+
+    @property
+    def protocol_audit(self):
+        return getattr(self.agent, "protocol_audit", self.agent.tools[0].protocol_audit)
+
+    @property
+    def result_audit(self):
+        return getattr(self.agent, "result_audit", [])
 
     def get_model(
             self,
@@ -117,8 +143,11 @@ class ReactAgent():
             model,
             port=None,
             api_key=None,
+            base_url=None,
             **kwargs
     ):
+        if base_url is not None:
+            return get_llm(model=model, api_key=api_key, base_url=base_url, **kwargs)
         llm = None
         if (api == "anthropic"):
             llm = ChatAnthropic(
@@ -152,6 +181,7 @@ class ReactAgent():
         return llm
         
     def generate(self, data_loader, test_spec, domain, log=None):
+        self.last_result = None
         try:
             self.agent.tools[0]._set_globals(data_loader.table_dict)
             dataset_desc = data_loader.data_desc
@@ -160,6 +190,7 @@ class ReactAgent():
             logger = LiveLogger(log) if log is not None else sys.stdout
 
             # Redirect stdout to capture real-time logs
+            previous_stdout = sys.stdout
             sys.stdout = logger
             try:
                 output = self.agent.invoke(input={
@@ -169,8 +200,9 @@ class ReactAgent():
     Thought:"""
                 })
             finally:
-                sys.stdout = logger.original_stdout  # Restore stdout
+                sys.stdout = previous_stdout
 
+            self.last_result = output.get('result')
             return output['output']
 
         except Exception as e:

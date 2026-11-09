@@ -13,3 +13,5 @@ langchain==0.3.7
 langgraph==0.2.39
 langchain_experimental==0.3.3
 ipython
+jsonschema>=4,<5
+threadpoolctl>=3,<4

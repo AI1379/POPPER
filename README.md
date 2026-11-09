@@ -1,5 +1,36 @@
 # POPPER: Automated Hypothesis Validation with Agentic Sequential Falsifications
 
+This is the [AI1379 research fork](https://github.com/AI1379/POPPER) of
+[snap-stanford/POPPER](https://github.com/snap-stanford/POPPER), based on upstream
+commit [`5961186`](https://github.com/snap-stanford/POPPER/commit/59611864e09dd15d7528e240ad87c7ddbb4a701c).
+The original paper and authors are credited below.
+
+## Research fork changes
+
+| Area | Changes in this fork |
+| --- | --- |
+| Model endpoints | Explicit `base_url` and API-key routing across the proposal, checking, execution and summary clients. |
+| Thinking and structured output | Compatible client retaining provider reasoning history, with opt-in automatic tool selection, local schema validation and bounded format-only repairs. |
+| Execution provenance | Optional guarded text and native-tool executors; accepted p-values come from result IDs registered during a successful execution of the current test. |
+| Python execution | AST-based execution handles final assignments and multiline statements, preserves tracebacks, and restores output/logging streams. |
+| Output and context | Lossless tool-output archives, repeated-warning counts, diagnostic-preserving output views and bounded historical observations. |
+| Runtime budgets | Optional terminable Python workers, request/compute limits, timing-based extensions and checkpointed resampling with a fixed plan. |
+| Audit and recovery | Usage/protocol journals and opt-in HTTP request/response checkpoints with input/source snapshots, inspection, export and explicit replay. |
+| Statistical instructions | Native execution carries the original ReAct template's statistical-integrity requirements, including valid tests, rigorous aggregation and no p-hacking. |
+
+The upstream p-to-e calibrators and sequential aggregation/decision functions are
+unchanged. Execution provenance verifies where a result came from; it does not
+establish the statistical validity of generated code. Tool protocols, context
+compression and budget feedback can affect model behavior, so record their
+settings when comparing experiments.
+
+The public API defaults to `execution_mode="legacy"` and native structured
+output. Guarded execution, prompt-based structured submission, output compaction,
+runtime budgets and request recording are optional. Examples below describe
+their entry points. The companion `popper-bias` experiment runner is maintained
+separately and is not included in this repository; its reviewer, persona and
+other experimental prompt variants are not default engine policies.
+
 This repository hosts the code base for the paper
 
 **Automated Hypothesis Validation with Agentic Sequential Falsifications**
@@ -45,11 +76,12 @@ For direct usage of Popper, you can install the package via pip:
 pip install popper_agent
 ```
 
-For source code development, you can clone the repository and install the package:
+The PyPI package above follows upstream. To use or develop this fork, install
+from its source checkout:
 ```bash
-git clone https://github.com/snap-stanford/POPPER.git
+git clone https://github.com/AI1379/POPPER.git
 cd POPPER
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Add the OpenAI/Anthropic API key to the environment variables:
@@ -131,7 +163,85 @@ agent = Popper(llm="qwen2 1.5B", is_locally_served=True, server_port=8080)
 
 ## Run on your own hypothesis and database
 
-You can simply dump in a set of datasets in your domain (e.g. business, economics, political science, etc.) and run Popper on your own hypothesis. 
+### Custom model names and OpenAI-compatible endpoints
+
+Pass an optional `base_url` to use any model name on an OpenAI-compatible API:
+
+```python
+import os
+from popper import Popper
+
+agent = Popper(
+    llm="your-custom-model",
+    base_url="https://your-model-server.example/v1",
+    api_key=os.environ["MY_LLM_API_KEY"],
+)
+```
+
+An explicit `base_url` takes priority over model-name prefixes and `server_port`.
+It is passed to all model clients, including the ReAct executor. No
+`is_locally_served` or `server_port` argument is needed for this mode.
+For authentication, an explicit non-placeholder `api_key` takes priority; otherwise
+`OPENAI_API_KEY` is used when set, falling back to `"EMPTY"` for unauthenticated
+servers. The service must support the structured outputs/tool calls used by POPPER.
+
+Omitting `base_url` preserves the existing GPT/Claude/local model selection.
+
+The compatible client also supports an opt-in `structured_output_mode="prompt"`.
+This mode exposes only the requested schema tool with `tool_choice="auto"`, adds
+an explicit submission instruction, and validates the tool name and arguments
+locally. Invalid submissions receive format-only repair feedback (two retries by
+default); unexpected calls are never executed. Successful outputs preserve the
+existing Pydantic/dict and `include_raw` contracts. Exhaustion raises an error or
+returns `parsed=None` with `parsing_error` when `include_raw=True`.
+
+Thinking responses retain `reasoning_content` for subsequent tool-call requests.
+Prompt mode uses complete, non-streaming responses because the installed
+LangChain version discards reasoning deltas when streaming. Native mode remains
+the default. After registering data and calling `agent.configure(...)`, select
+the policy on every configured compatible client:
+
+```python
+from popper.request_scene import configured_clients
+
+for client in configured_clients(agent).values():
+    if client is not None:
+        client.structured_output_mode = "prompt"
+        client.structured_max_retries = 2
+```
+
+This example requires the explicit `base_url` mode above. Provider-specific
+thinking options can be set through each client's `extra_body`; prompt mode
+does not itself enable or disable thinking. The separate `popper-bias` runner
+applies these options and records them in each experiment's configuration.
+
+Offline regression tests (no external API requests):
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+Use pytest to include both unittest-based cases and pytest functions, including
+the request-checkpoint and native statistical-instruction regressions.
+
+ReAct execution can be selected with the optional
+`agent.configure(execution_mode="native_tools")` argument. The other choices are
+`"legacy"` and `"guarded_text"`. The default preserves the
+legacy text protocol. `guarded_text` rejects mixed action/observation transcripts;
+`native_tools` uses actual API tool calls and replays assistant reasoning with
+the tool history. Both guarded modes require Python to register a result through
+`record_test_result(p_value, n=..., estimate=...)`, then submit its result ID.
+Only successful executions from the current test can supply the accepted p-value.
+This validates execution provenance, not the correctness of generated statistics.
+Native execution requires a model client supporting `bind_tools` and
+`tool_choice="auto"`; other structured-output nodes keep their existing settings.
+The separate `popper-bias` workspace contains the paired `harness_audit.py`
+experiment; it is not required to use this library's execution modes.
+
+### Loading your data
+
+You can simply dump in a set of datasets in your domain (e.g. business, economics, political science, etc.) and run Popper on your own hypothesis.
 We only expect every file is in a csv or pkl format.
 
 ```python
@@ -216,3 +326,46 @@ The DiscoveryBench benchmark and some of the baseline agents are built on top of
 ## Contact
 
 For any questions, please raise an issue in the GitHub or contact Kexin Huang (kexinh@cs.stanford.edu).
+
+## Model request checkpoints
+
+The compatible OpenAI client can record each model call before HTTP transmission.
+Enable it with `Popper(..., base_url=..., request_scene_dir="artifacts/request_scenes")`,
+or call `popper.configure_request_recording(directory)` after `configure()`.
+The statistical experiment runner also enables this when `run_popper` receives
+an `artifact_root`.
+
+Each scene contains the actual serialized request body, readable request JSON,
+response bytes, endpoint, role, timestamps, hashes, transport timeout and library
+versions. Tool schemas, delivered tool-result views and provider continuation
+fields are preserved. A failed request retains its pre-send snapshot, SDK retries
+receive separate scene IDs, and incomplete response streams are marked partial.
+Authentication headers are excluded. Known credential values echoed in a body
+are redacted, and the scene records that its body is no longer exact.
+
+With the statistical runner, `request_scenes/context/` also contains configuration,
+public CSV/problem inputs and the Python source snapshot. Files larger than 64 MiB
+are referenced by original path and SHA-256 in the manifest. These checkpoints
+restore the model-call context. Python kernel memory and arbitrary process state
+require a separate process-checkpoint mechanism.
+
+```bash
+python -m popper.request_scene list artifacts/request_scenes
+python -m popper.request_scene inspect artifacts/request_scenes/designer/SCENE_ID
+python -m popper.request_scene export artifacts/request_scenes/designer/SCENE_ID --output recovered_call
+python -m popper.request_scene replay recovered_call
+```
+
+`replay` defaults to hash checks and a metadata preview. To send one request using
+the recorded body, supply `--send`, a fresh output directory, an explicit matching
+endpoint and the environment-variable name holding its API key.
+
+```bash
+python -m popper.request_scene replay recovered_call --send --output replay_01 --endpoint https://api.deepseek.com/chat/completions --api-key-env DEEPSEEK_API_KEY
+```
+
+The replay command records the new response and leaves returned tool calls for
+inspection. Its sending mode supports non-streaming requests. Streaming scenes
+remain available for inspection/export. `request_public.json` and
+`response_public.json` omit opaque continuation fields from readable exports.
+Raw scene bodies retain those fields when the provider supplied them.

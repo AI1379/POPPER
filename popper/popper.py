@@ -13,11 +13,18 @@ import shutil
 class Popper:
     """Wrapper class for hypothesis validation using sequential falsification testing."""
     
-    def __init__(self, llm: str = "claude-3-5-sonnet-20240620", is_locally_served = False, server_port = None, api_key = "EMPTY", **kwargs):
+    def __init__(self, llm: str = "claude-3-5-sonnet-20240620", is_locally_served = False, server_port = None, api_key = "EMPTY", base_url: Optional[str] = None, request_scene_dir: Optional[str] = None, **kwargs):
         """Initialize Popper.
         
         Args:
             llm (str): Name of the LLM model to use
+            base_url (Optional[str]): OpenAI-compatible API base URL. When provided,
+                model names are passed through without provider-prefix routing and
+                server_port is not required. Uses api_key, then OPENAI_API_KEY,
+                then "EMPTY" for services without authentication.
+            request_scene_dir (Optional[str]): Save model-call checkpoints for the
+                compatible client, including provider continuation fields but no
+                request headers. Can also be enabled after configure().
             **kwargs: Additional arguments to pass to SequentialFalsificationTest
         """
         self.llm = llm
@@ -26,6 +33,8 @@ class Popper:
         self.is_local = is_locally_served
         self.port = server_port
         self.api_key = api_key
+        self.base_url = base_url
+        self.request_scene_dir = request_scene_dir
         self.kwargs = kwargs
 
     def register_data(self, data_path: str, data_sampling: int = -1, loader_type: str = 'bio', metadata: Optional[Dict] = None):
@@ -76,7 +85,8 @@ class Popper:
                  max_retry: int = 5,
                  time_limit: int = 2,
                  relevance_checker: bool = True,
-                 use_react_agent: bool = True):
+                 use_react_agent: bool = True,
+                 execution_mode: str = 'legacy'):
         """Configure the sequential falsification test parameters.
         
         Args:
@@ -87,11 +97,16 @@ class Popper:
             time_limit (int): Time limit in hours
             relevance_checker (bool): Whether to use relevance checker
             use_react_agent (bool): Whether to use ReAct agent
+            execution_mode (str): legacy, guarded_text, or native_tools.
         """
+        if execution_mode not in ('legacy', 'guarded_text', 'native_tools'):
+            raise ValueError('Unknown execution_mode')
+        if not use_react_agent and execution_mode != 'legacy':
+            raise ValueError('execution_mode requires use_react_agent=True')
         if self.data_loader is None:
             raise ValueError("Please register data first using register_data()")
             
-        self.agent = SequentialFalsificationTest(llm=self.llm, is_local=self.is_local, port=self.port, api_key=self.api_key)
+        self.agent = SequentialFalsificationTest(llm=self.llm, is_local=self.is_local, port=self.port, api_key=self.api_key, base_url=self.base_url)
         self.agent.configure(
             data=self.data_loader,
             alpha=alpha,
@@ -103,6 +118,24 @@ class Popper:
             use_react_agent=use_react_agent,
             **self.kwargs
         )
+        if execution_mode != 'legacy':
+            self.agent.test_coding_agent.agent.configure_execution(execution_mode)
+        if self.request_scene_dir is not None:
+            self.configure_request_recording(self.request_scene_dir)
+
+    def configure_request_recording(self, directory):
+        """Enable HTTP-body snapshots for every configured compatible client."""
+        from popper.request_scene import configured_clients
+        clients = configured_clients(self)
+        active = {role: client for role, client in clients.items() if client is not None}
+        if not active:
+            raise ValueError("Configure POPPER before enabling request recording")
+        if any(not hasattr(client, 'request_scene_dir') for client in active.values()):
+            raise TypeError("Request recording currently requires the compatible OpenAI client")
+        self.request_scene_dir = str(directory)
+        for role, client in active.items():
+            client.request_scene_dir = str(directory)
+            client.request_scene_role = role
 
     def validate(self, hypothesis: str) -> Dict[str, Any]:
         """Validate a scientific hypothesis using sequential falsification testing.

@@ -9,12 +9,21 @@ import numpy as np
 import pandas as pd
 
 from popper.llm.custom_model import CustomChatModel
+from popper.llm.compatible_model import CompatibleChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from langchain_core.messages.base import get_msg_title_repr
 from langchain_core.utils.interactive_env import is_interactive_env
 
-def get_llm(model = 'claude-3-5-sonnet-20240620', temperature=0.7, port=30000, api_key = "EMPTY", **kwargs):
+def get_llm(model = 'claude-3-5-sonnet-20240620', temperature=0.7, port=30000, api_key = "EMPTY", base_url=None, **kwargs):
+    """An explicit base_url selects an OpenAI-compatible service for any model name."""
+    if base_url is not None:
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("base_url must be a non-empty URL or None")
+        endpoint_key = api_key if api_key not in (None, "", "EMPTY") else os.environ.get("OPENAI_API_KEY") or "EMPTY"
+        return CompatibleChatOpenAI(model=model, base_url=base_url, api_key=endpoint_key,
+                          temperature=temperature, **kwargs)
+
     source = "Local"
     if model[:7] == 'claude-':
         source = 'Anthropic'

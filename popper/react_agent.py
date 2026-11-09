@@ -182,6 +182,7 @@ class ReactAgent():
         
     def generate(self, data_loader, test_spec, domain, log=None):
         self.last_result = None
+        self.last_error = None
         try:
             self.agent.tools[0]._set_globals(data_loader.table_dict)
             dataset_desc = data_loader.data_desc
@@ -206,6 +207,7 @@ class ReactAgent():
             return output['output']
 
         except Exception as e:
+            self.last_error = {"type": type(e).__name__, "message": str(e)}
             error_message = f"Execution Stopped due to: {e}\n{traceback.format_exc()}"
             print(error_message)
             if log is not None:

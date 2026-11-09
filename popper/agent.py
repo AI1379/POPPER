@@ -661,24 +661,33 @@ class falsification_test_react_agent:
             
             return falsification_test_json
         
+        log = log if log is not None else {'executor': []}
+        self.last_attempt_audit = []
+
+        def failed(reason):
+            return {"error": "yes", "status": "Failed test", "captured_output": None,
+                    "p_val": None, "failure_reason": reason, "attempts": self.last_attempt_audit}
+
         falsification_test = parse_falsification_test(question)
         
         if not falsification_test:
             print("Failed to parse Falsification Test")
             print(question)
-            return {
-                "error": "yes",
-                "status": "Failed test",
-                "captured_output": None,
-                "p_val": None,
-            }
+            return failed("invalid_test_proposal")
         
         test_spec = json.dumps(falsification_test, indent=4)
         
-        for _ in range(self.max_retry):
+        for attempt_index in range(self.max_retry):
+            attempt = {"attempt": attempt_index + 1, "status": "started"}
+            self.last_attempt_audit.append(attempt)
+            tool = self.agent.agent.tools[0]
+            execution_start = len(tool.executions)
+            reply_start = len(self.agent.protocol_audit)
             try:
                 captured_output = self.agent.generate(self.data_loader, test_spec, self.domain, log)
                 if not captured_output:
+                    attempt.update(status="failed", reason="execution_error",
+                                   error=getattr(self.agent, 'last_error', None))
                     print("---No Captured Output---")
                     print("---DECISION: RE-TRY SOLUTION---")
                     log['executor'].append("No Captured Output - Retry Solution")
@@ -692,30 +701,35 @@ class falsification_test_react_agent:
                     parsed_output = {'check_output_error': 'Yes',
                                      'p_val': str(self.agent.last_result['p_value'])}
                 else:
-                    for _ in range(10):
+                    try:
+                        # Structured-output repair operates on this same output.
+                        # Its exhaustion must not draw another whole analysis.
                         parsed_output = self.pvalue_parser.invoke({ "messages": [("user", captured_output)]}).dict()
-                        if parsed_output:
-                            print(parsed_output)
-                            break
+                    except Exception as exc:
+                        attempt.update(status="failed", reason="pvalue_parse_error",
+                                       error={"type": type(exc).__name__, "message": str(exc)})
+                        return failed("pvalue_parse_error")
                 
                 if 'check_output_error' in parsed_output and parsed_output['check_output_error'] and parsed_output['check_output_error'].strip().lower() == "no":
                     print("---P-value OUTPUT CHECK: FAILED---")
-                    print("---DECISION: RE-TRY SOLUTION---")
-                    log['executor'].append("P-value OUTPUT CHECK: FAILED - Retry Solution")
-                    continue
-                p_val = float(parsed_output['p_val'])
-                
-                if np.isnan(p_val):
-                    print("---P-value is nan: FAILED---")
-                    print("---DECISION: RE-TRY SOLUTION---")
-                    log['executor'].append("P-value is nan: FAILED - Retry Solution")
-                    continue
+                    log['executor'].append("P-value OUTPUT CHECK: FAILED - Analysis will not be rerun")
+                    attempt.update(status="failed", reason="no_valid_pvalue")
+                    return failed("no_valid_pvalue")
+                try:
+                    p_val = float(parsed_output['p_val'])
+                    if not np.isfinite(p_val) or not 0 < p_val <= 1:
+                        raise ValueError("p-value must be finite and in (0, 1]")
+                except (ValueError, TypeError, KeyError) as exc:
+                    attempt.update(status="failed", reason="invalid_pvalue", error=str(exc))
+                    return failed("invalid_pvalue")
 
-                if p_val == 0:
-                    print("---P-value is 0: FAILED---")
-                    print("---DECISION: RE-TRY SOLUTION---")
-                    log['executor'].append("P-value is 0: FAILED - Retry Solution")
-                    continue
+                attempt.update(status="success", p_value=p_val)
+                if self.agent.execution_mode == 'legacy':
+                    from popper.execution_audit import audit_legacy_pvalue
+                    attempt['legacy_pvalue_audit'] = audit_legacy_pvalue(
+                        p_val, tool.executions[execution_start:], self.agent.protocol_audit[reply_start:])
+                else:
+                    attempt['registered_result'] = dict(self.agent.last_result)
 
                 # No errors
                 print("---NO CODE TEST FAILURES---")
@@ -727,9 +741,13 @@ class falsification_test_react_agent:
                     "status": "success",
                     "captured_output": captured_output,
                     "p_val": parsed_output['p_val'],
+                    "attempts": self.last_attempt_audit,
+                    "fallback_reason": (self.agent.last_result or {}).get('fallback_reason'),
                 }
                     
             except Exception as e:
+                attempt.update(status="failed", reason="execution_error",
+                               error={"type": type(e).__name__, "message": str(e)})
                 print(f"Falsification Test failed with the following error: {e}")
                 print(traceback.format_exc())
                 print("---DECISION: RE-TRY SOLUTION---")
@@ -738,12 +756,7 @@ class falsification_test_react_agent:
         print(f"Falsification Test exceeded maximum number of retries; max_retries={self.max_retry}")
         print("---DECISION: FINISH---")
         log['executor'].append(f"Falsification Test exceeded maximum number of retries; max_retries={self.max_retry}")
-        return {
-            "error": "yes",
-            "status": "Failed test",
-            "captured_output": None,
-            "p_val": None,
-        }
+        return failed("execution_retries_exhausted")
         
 
 class likelihood_estimation_agent:
@@ -845,6 +858,27 @@ class SequentialFalsificationTest:
             'sequential_testing': []
         }
 
+    def complete_decision(self, reason):
+        """Freeze a terminal statistical outcome before any reporting model call."""
+        if self.decision_snapshot is not None:
+            return
+        statistic = None if self.res_stat is None else float(self.res_stat)
+        if statistic is not None and not np.isfinite(statistic):
+            statistic = str(statistic)
+        self.decision_snapshot = dict(
+            completed=True, stop_reason=reason, alpha=self.alpha,
+            aggregate_test=self.aggregate_test,
+            rejected=bool(self.res) if self.tracked_stat else None,
+            statistic=statistic, p_values=list(self.tracked_stat),
+            tracked_tests=list(self.tracked_tests))
+        if self.decision_path is not None:
+            from pathlib import Path
+            path = Path(self.decision_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(self.decision_snapshot, indent=2, allow_nan=False), encoding='utf-8')
+            temporary.replace(path)
+
     def summarize(self):
         to_print = [get_msg_title_repr("Summarizer", bold=is_interactive_env())]
         print(to_print[0])
@@ -922,6 +956,9 @@ class SequentialFalsificationTest:
 
         self.tracked_tests = []
         self.tracked_stat = []
+        self.test_audit = []
+        self.decision_snapshot = None
+        self.decision_path = None
 
         class State(TypedDict):
             messages: Annotated[list, add_messages]
@@ -935,6 +972,8 @@ class SequentialFalsificationTest:
                     proposal_check = self.proposal_relevance_checker.invoke({ "messages": [("user", f"Subhypothesis: {proposal}; Main hypothesis: {self.main_hypothesis}")]}).dict()
                     if float(proposal_check['relevance_score']) < 0.8:
                         self.test_proposal_agent.add_to_failed_tests(proposal)
+                        self.test_audit.append(dict(kind="relevance", status="rejected",
+                                                    proposal=proposal, check=proposal_check))
                         print(f"Proposed falsification test is not relevant enough to the main hypothesis! \n Proposal: \n{proposal} \nRelevance score: {proposal_check['relevance_score']} \nReasoning: {proposal_check['relevance_reasoning']}")
                         self.log['relevance_checker'].append(f"Proposed falsification test is not relevant enough to the main hypothesis! \n Proposal: \n{proposal} \nRelevance score: {proposal_check['relevance_score']} \nReasoning: {proposal_check['relevance_reasoning']}")
                     else:
@@ -946,9 +985,18 @@ class SequentialFalsificationTest:
                 return {"cur_test_proposal": proposal, "messages": [('assistant', "Proposed falsification test: " + proposal)]}
 
         def implement_falsification_test(state: State):
-            out = self.test_coding_agent.go(state["cur_test_proposal"], self.log)
+            event = dict(kind="implementation", status="started", proposal=state["cur_test_proposal"])
+            self.test_audit.append(event)
+            try:
+                out = self.test_coding_agent.go(state["cur_test_proposal"], self.log)
+            except Exception as exc:
+                event.update(status="failed", failure_reason=type(exc).__name__, error=str(exc),
+                             attempts=getattr(self.test_coding_agent, 'last_attempt_audit', []))
+                raise
+            event.update(attempts=out.get('attempts', []))
 
             if out['status'] == "Failed test":
+                event.update(status="failed", failure_reason=out.get('failure_reason', 'implementation_failed'))
                 self.implementation_success_status = False
                 self.test_proposal_agent.add_to_failed_tests(state["cur_test_proposal"])
                 return {"messages": [('assistant', f"Failed to implement test: {state['cur_test_proposal']}")]}
@@ -965,9 +1013,12 @@ class SequentialFalsificationTest:
                     likelihood_h1 = float(out['likelihood_h1'])
                     likelihood_h0 = float(out['likelihood_h0'])
                     self.tracked_stat.append(likelihood_h1/likelihood_h0)
+                    event.update(status="success", likelihood_ratio=float(likelihood_h1/likelihood_h0))
                     return {"messages": [('assistant', f"Falsification test: {state['cur_test_proposal']} \n likelihood under H1: {likelihood_h1} \n likelihood under H0: {likelihood_h0} \n likelihood ratio: {likelihood_h1/likelihood_h0}")]}
                 else:
                     self.tracked_stat.append(float(out['p_val']))
+                    event.update(status="success", p_value=float(out['p_val']),
+                                 fallback_reason=out.get('fallback_reason'))
                     return {"messages": [('assistant', f"Falsification test: {state['cur_test_proposal']} \n p-value: {out['p_val']}")]}
 
         def sequential_testing(state: State):
@@ -1018,6 +1069,7 @@ class SequentialFalsificationTest:
             #     return "design_falsification_test"
         
         def summarizer(state: State):
+            self.complete_decision("rejected")
             return self.summarize()
 
         
@@ -1052,6 +1104,9 @@ class SequentialFalsificationTest:
             if self.num_of_tests + 1 > self.max_num_of_tests or self.max_failed_tests <= len(self.test_proposal_agent.failed_tests):
                 print('Surpassing the maximum number of falsification tests, stopped and summarizing...')
                 self.log['summarizer'].append('Surpassing the maximum number of falsification tests, stopped and summarizing...')
+                reason = ("rejected" if self.res else "max_tests" if self.num_of_tests >= self.max_num_of_tests
+                          else "max_failed_tests")
+                self.complete_decision(reason)
                 out = self.summarize()['messages'][0][1]
                 self.log['summarizer'].append(out)
                 break

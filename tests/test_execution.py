@@ -125,6 +125,47 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNone(executor.last_result)
         self.assertEqual(executor.tools[0].executions, [])
 
+    def test_scattered_python_typos_are_observations_not_protocol_rejections(self):
+        def final(prompt):
+            import re
+            return AIMessage(content='Final Answer: result_id=' + re.findall(r'result_[a-f0-9]{32}', prompt)[-1])
+        replies = []
+        for index in range(3):
+            replies.extend([AIMessage(content='Action: python_repl_ast\nAction Input: x ='),
+                            AIMessage(content=f'Action: python_repl_ast\nAction Input: x = {index}')])
+        replies.extend([AIMessage(content='Action: python_repl_ast\nAction Input: record_test_result(0.4)'), final])
+        model = FakeModel(replies)
+        executor = GuardedExecutor(model, 'guarded_text', max_protocol_retries=0)
+        result = executor.invoke(dict(system_prompt='', input=''))
+        self.assertEqual(result['result']['p_value'], .4)
+        self.assertIn('SyntaxError', model.inputs[1])
+        self.assertEqual(sum(not e['succeeded'] for e in executor.tools[0].executions), 3)
+        self.assertTrue(all(e['accepted'] for e in executor.protocol_audit))
+
+    def test_protocol_repair_limit_is_consecutive(self):
+        replies = []
+        for _ in range(3):
+            replies.extend([AIMessage(content='invented answer'), action('x = 1')])
+        replies.extend([action('record_test_result(.5)'), finish_from_history])
+        executor = GuardedExecutor(FakeModel(replies), 'native_tools', max_protocol_retries=1)
+        self.assertEqual(executor.invoke(dict(system_prompt='', input=''))['result']['p_value'], .5)
+
+    def test_explicit_p1_fallback_is_registered_with_reason(self):
+        executor = GuardedExecutor(FakeModel([
+            action('record_test_result(1.0, fallback_reason="No valid test for this estimand")'),
+            finish_from_history]), 'native_tools')
+        result = executor.invoke(dict(system_prompt='', input=''))['result']
+        self.assertEqual(result['p_value'], 1)
+        self.assertEqual(result['fallback_reason'], 'No valid test for this estimand')
+        registry = ResultRegistry(CustomPythonAstREPLTool())
+        for p, reason in [(.01, 'not feasible'), (1, ''), (1, False)]:
+            with self.subTest(p=p, reason=reason), self.assertRaises(ProtocolError):
+                registry.record(p, fallback_reason=reason)
+
+    def test_trailing_prose_remains_a_protocol_violation(self):
+        with self.assertRaises(ProtocolError):
+            parse_guarded_text('Action: python_repl_ast\nAction Input: ```python\nprint(1)\n```\nDone.')
+
 
 if __name__ == '__main__':
     unittest.main()

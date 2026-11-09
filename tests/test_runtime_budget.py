@@ -38,6 +38,18 @@ def finish(history):
 
 
 class BudgetTests(unittest.TestCase):
+    def test_worker_without_compaction_preserves_long_output_and_p1_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            budget = RuntimeBudget.create(Path(directory), initial=100, hard=300, tool_seconds=20)
+            model = Model([action("print('x' * 20000)\nrecord_test_result(1., fallback_reason='not identifiable')"), finish])
+            executor = GuardedExecutor(model, 'native_tools')
+            executor.configure_budget(budget)
+            result = executor.invoke(dict(system_prompt='', input=''))
+            output = next(m.content for m in model.inputs[1] if isinstance(m, ToolMessage))
+            self.assertGreater(len(output), 20000)
+            self.assertNotIn('characters omitted', output)
+            self.assertEqual(result['result']['fallback_reason'], 'not identifiable')
+
     def test_runtime_extension_and_hard_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
             b = RuntimeBudget.create(Path(directory), initial=200, hard=400)

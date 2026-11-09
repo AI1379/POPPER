@@ -29,6 +29,11 @@ warnings and use stable tail probabilities; p must be finite and 0 < p <= 1.
 Submit the resulting ID to finish. An ID from an earlier test is invalid.
 Registration proves execution only, not validity: implement the requested test
 faithfully; do not substitute constants, simulated data, or a different estimand.
+Exception: if no valid test is possible, or the proposed H1 is incompatible with
+the result, register the conservative fallback with
+record_test_result(1.0, fallback_reason="specific reason the test cannot support H1").
+This is an explicit non-rejection, not an execution failure. Do not invent a small
+p-value. Ordinary computed p-values, including a computed 1.0, need no reason.
 On protocol rejection, repair the submission and preserve the analysis/result;
 do not search for a more significant result. Keep output focused on diagnostics,
 sample sizes, estimates, uncertainty and p-values. Full output is archived and
@@ -60,7 +65,8 @@ class ResultRegistry:
         self.tool = tool
         self.records: dict[str, dict[str, Any]] = {}
 
-    def record(self, p_value: Any, *, n: Any = None, estimate: Any = None) -> str:
+    def record(self, p_value: Any, *, n: Any = None, estimate: Any = None,
+               fallback_reason: str | None = None) -> str:
         p = float(p_value)
         if isinstance(p_value, bool) or not math.isfinite(p) or not 0 < p <= 1:
             raise ProtocolError("p_value must be finite and 0 < p <= 1")
@@ -68,10 +74,14 @@ class ResultRegistry:
             raise ProtocolError("n must be a positive integer")
         if estimate is not None and not math.isfinite(float(estimate)):
             raise ProtocolError("estimate must be finite")
+        if fallback_reason is not None:
+            if p != 1.0 or not isinstance(fallback_reason, str) or not fallback_reason.strip():
+                raise ProtocolError("A conservative fallback requires p=1 and a nonempty reason")
+            fallback_reason = fallback_reason.strip()
         result_id = "result_" + uuid4().hex
         record = dict(result_id=result_id, p_value=p, n=int(n) if n is not None else None,
                       estimate=float(estimate) if estimate is not None else None,
-                      execution_index=len(self.tool.executions))
+                      execution_index=len(self.tool.executions), fallback_reason=fallback_reason)
         self.records[result_id] = record
         print("REGISTERED_TEST_RESULT " + json.dumps(record))
         return result_id
@@ -87,10 +97,11 @@ class ResultRegistry:
 
 
 def parse_guarded_text(text: str) -> tuple[str, str]:
-    """Accept one syntactically valid Python action OR one result-ID submission.
+    """Accept one Python action OR one result-ID submission.
 
     Parse Python before inspecting marker strings so print('Observation:') is
-    valid. A combined fabricated action/observation transcript is invalid Python.
+    valid. Syntax mistakes reach Python and return its actual diagnostic; mixed
+    action/observation transcripts remain protocol violations.
     """
     clean = text.strip()
     if clean.startswith("```") and clean.endswith("```"):
@@ -100,16 +111,18 @@ def parse_guarded_text(text: str) -> tuple[str, str]:
         if action.group(1).strip() != "python_repl_ast":
             raise ProtocolError("Only python_repl_ast is allowed")
         code = clean[action.end():].strip()
-        if code.startswith("```") and code.endswith("```"):
-            code = code[3:-3].strip()
-            if code.startswith("python\n"):
-                code = code[7:]
+        if code.startswith("```"):
+            fence = re.fullmatch(r"```(?:python)?\s*\n(.*?)\n```\s*", code, re.DOTALL)
+            if fence is None:
+                raise ProtocolError("Submit one closed Python fence without trailing prose")
+            code = fence.group(1)
+        if not code.strip():
+            raise ProtocolError("Empty Python action")
         try:
-            if not ast.parse(code).body:
-                raise SyntaxError("empty action")
+            ast.parse(code)
         except SyntaxError as exc:
-            reason = "Untrusted Observation transcript" if "Observation:" in code else "Invalid or mixed action"
-            raise ProtocolError(reason + ": submit only one Python action, then wait for the tool") from exc
+            if re.search(r"(?:^|\n|\))\s*(?:Observation|Final Answer|Action(?: Input)?)\s*:", code):
+                raise ProtocolError("Untrusted Observation or mixed action transcript") from exc
         if "Observation:" in clean[:action.start()] or "Final Answer:" in clean[:action.start()]:
             raise ProtocolError("Mixed observation/final answer and action")
         return "python_repl_ast", code
@@ -231,6 +244,9 @@ class GuardedExecutor:
                                    else str(tool.invoke(argument)))
                     event["execution_index"] = len(tool.executions) - 1
                     event["accepted"] = True
+                    # The repair limit applies to consecutive protocol rejections,
+                    # never Python exceptions or unrelated earlier mistakes.
+                    repairs = 0
                 else:
                     record = registry.resolve(argument)
                     self.last_result = record

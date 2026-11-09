@@ -329,6 +329,22 @@ For any questions, please raise an issue in the GitHub or contact Kexin Huang (k
 
 ## Model request checkpoints
 
+The research runner now separates terminal statistical decisions from report
+generation. `SequentialFalsificationTest.decision_snapshot` is set before the
+summarizer; an optional `decision_path` writes it atomically. `test_audit` records
+failed implementations, internal attempts and relevance rejections separately.
+The companion `popper-bias` runner retains completed decisions after reporting
+errors and reports failed-test rates and fixed-trajectory p=1 sensitivity results.
+
+Guarded executors pass ordinary syntax errors to Python as observations and count
+only consecutive protocol violations against the repair limit. An explicit
+conservative fallback is `record_test_result(1.0, fallback_reason="reason")`,
+followed by submission of its result ID. P-value parser exhaustion no longer
+reruns the whole legacy analysis. These changes define a new research harness;
+`legacy` is not an exact upstream baseline. Offline differential tests under
+`tests/test_upstream_comparison.py` use source excerpts pinned to upstream commit
+`59611864e09dd15d7528e240ad87c7ddbb4a701c`, including intentional executor differences.
+
 The compatible OpenAI client can record each model call before HTTP transmission.
 Enable it with `Popper(..., base_url=..., request_scene_dir="artifacts/request_scenes")`,
 or call `popper.configure_request_recording(directory)` after `configure()`.

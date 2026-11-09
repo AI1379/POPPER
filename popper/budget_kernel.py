@@ -56,7 +56,8 @@ class BudgetKernel:
             # never cause a subsequent kernel to overwrite that raw archive.
             store.audit = [json.loads(p.read_text(encoding='utf-8'))
                            for p in sorted(self.budget.root.glob('tool_*.json'))]
-        options = dict(max_chars=store.max_chars, compact_output=store.compact) if store else {}
+        options = (dict(max_chars=store.max_chars, compact_output=store.compact)
+                   if store else dict(compact_output=False, compact_context=False))
         self.process = context.Process(target=_serve, args=(child, self.tables, str(self.budget.root),
             self.session_id, self.tool.executions, self.tool.output_audit, options), daemon=True)
         self.process.start()
